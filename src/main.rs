@@ -74,7 +74,10 @@ async fn main() -> std::io::Result<()> {
 #[get("/{account_id}/{path:.*}")]
 async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl Responder {
     let namespace_account_id = request.match_info().get("account_id").unwrap();
-    let path = request.match_info().get("path").unwrap();
+    let mut path = request.match_info().get("path").unwrap().to_string();
+    if path.is_empty() || path.ends_with('/') {
+        path += "index.html";
+    }
     let hostname = request.connection_info().host().to_string();
     let predecessor_account_id: Option<AccountId> = hostname
         .strip_suffix(&app_state.hostname)
