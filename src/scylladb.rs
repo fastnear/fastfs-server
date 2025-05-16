@@ -83,7 +83,7 @@ pub fn create_rustls_client_config() -> Arc<ClientConfig> {
 
 impl ScyllaDb {
     pub async fn new_scylla_session() -> anyhow::Result<Session> {
-        let scylla_url = env::var("SCYLLA_URL").expect("SCYLLA_DB_URL must be set");
+        let scylla_url = env::var("SCYLLA_URL").expect("SCYLLA_URL must be set");
         let scylla_username = env::var("SCYLLA_USERNAME").expect("SCYLLA_USERNAME must be set");
         let scylla_password = env::var("SCYLLA_PASSWORD").expect("SCYLLA_PASSWORD must be set");
 
