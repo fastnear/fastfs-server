@@ -1,43 +1,53 @@
-use dotenv::dotenv;
-use std::env;
+mod scylladb;
 
+use crate::scylladb::ScyllaDb;
 use actix_cors::Cors;
 use actix_web::http::header;
 use actix_web::{get, middleware, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use dotenv::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::AccountId;
-use serde::{Deserialize, Serialize};
-use serde_with::base64::Base64;
-use serde_with::serde_as;
+use fastnear_primitives::types::ChainId;
+use std::env;
+use std::sync::Arc;
+
+const PROJECT_ID: &str = "fastfs-server";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub redis_client: redis::Client,
     pub hostname: String,
-}
-
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FastfsFileContent {
-    pub mime_type: String,
-    #[serde_as(as = "Base64")]
-    pub content: Vec<u8>,
+    pub scylladb: Arc<ScyllaDb>,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
-    let redis_client =
-        redis::Client::open(env::var("REDIS_URL").expect("Missing REDIS_URL env var"))
-            .expect("Failed to connect to Redis");
+    tracing_subscriber::fmt()
+        .with_env_filter("scylladb=info,fastfs-server=info")
+        .init();
 
     let hostname = env::var("HOSTNAME").expect("Missing HOSTNAME env var");
 
-    tracing_subscriber::fmt()
-        .with_env_filter("redis=info")
-        .with_env_filter("api=info")
-        .init();
+    let chain_id: ChainId = env::var("CHAIN_ID")
+        .expect("CHAIN_ID required")
+        .try_into()
+        .expect("Invalid chain id");
+
+    let scylla_session = ScyllaDb::new_scylla_session()
+        .await
+        .expect("Can't create scylla session");
+
+    ScyllaDb::test_connection(&scylla_session)
+        .await
+        .expect("Can't connect to scylla");
+
+    tracing::info!(target: PROJECT_ID, "Connected to Scylla");
+
+    let scylladb = Arc::new(
+        ScyllaDb::new(chain_id, scylla_session)
+            .await
+            .expect("Can't create scylla db"),
+    );
 
     HttpServer::new(move || {
         // Configure CORS middleware
@@ -54,8 +64,8 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(web::Data::new(AppState {
-                redis_client: redis_client.clone(),
                 hostname: hostname.clone(),
+                scylladb: Arc::clone(&scylladb),
             }))
             .wrap(cors)
             .wrap(middleware::Logger::new(
@@ -85,36 +95,37 @@ async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl 
     if predecessor_account_id.is_none() {
         return HttpResponse::InternalServerError().finish();
     }
+    let predecessor_account_id = predecessor_account_id.unwrap();
+    tracing::info!(target: PROJECT_ID, "GET {} {} {}", predecessor_account_id, namespace_account_id, path);
 
-    let key = format!(
-        "fastfs:{}:{}:{}",
-        predecessor_account_id.unwrap(),
-        namespace_account_id,
-        path
-    );
-    tracing::info!(target: "api", "GET {}", key);
-
-    let data: Option<String> = redis::cmd("GET")
-        .arg(key)
-        .query_async(
-            &mut app_state
-                .redis_client
-                .get_multiplexed_async_connection()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let res = app_state
+        .scylladb
+        .get_fastfs(predecessor_account_id.as_str(), namespace_account_id, &path)
+        .await;
+    let data = match res {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(target: PROJECT_ID, "Error getting fastfs data, {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
 
     if let Some(data) = data {
-        if let Ok(FastfsFileContent { mime_type, content }) = serde_json::from_str(&data) {
-            HttpResponse::Ok()
+        if let (Some(mime_type), Some(content)) = (data.mime_type, data.content) {
+            return HttpResponse::Ok()
                 .append_header((header::CONTENT_TYPE, mime_type))
-                .body(content)
-        } else {
-            HttpResponse::InternalServerError().finish()
+                .append_header(("x-fastdata-receipt-id", data.receipt_id.to_string()))
+                .append_header((
+                    "x-fastdata-tx-hash",
+                    data.tx_hash.map(|h| h.to_string()).unwrap_or_default(),
+                ))
+                .append_header(("x-fastdata-block-height", data.block_height.to_string()))
+                .append_header((
+                    "x-fastdata-block-timestamp",
+                    data.block_timestamp.to_string(),
+                ))
+                .body(content);
         }
-    } else {
-        HttpResponse::NotFound().finish()
     }
+    HttpResponse::NotFound().finish()
 }
