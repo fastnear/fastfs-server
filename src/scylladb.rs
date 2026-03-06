@@ -24,6 +24,13 @@ pub struct FastfsRow {
     pub nonce: i32,
 }
 
+#[derive(DeserializeRow)]
+pub struct FastfsMetaRow {
+    pub receipt_id: String,
+    pub block_timestamp: i64,
+    pub nonce: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct FastfsParsedRow {
     pub receipt_id: CryptoHash,
@@ -55,6 +62,7 @@ impl From<FastfsRow> for FastfsParsedRow {
 
 pub struct ScyllaDb {
     select_fastfs: PreparedStatement,
+    select_fastfs_meta: PreparedStatement,
 
     pub scylla_session: Session,
 }
@@ -129,6 +137,11 @@ impl ScyllaDb {
                 "SELECT receipt_id, tx_hash, block_height, block_timestamp, mime_type, content, offset, full_size, nonce FROM s_fastfs_v2 WHERE predecessor_id = ? AND current_account_id = ? AND relative_path = ? LIMIT 32",
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
+            select_fastfs_meta: Self::prepare_query(
+                &scylla_session,
+                "SELECT receipt_id, block_timestamp, nonce FROM s_fastfs_v2 WHERE predecessor_id = ? AND current_account_id = ? AND relative_path = ? LIMIT 1",
+                scylla::frame::types::Consistency::LocalOne,
+            ).await?,
             scylla_session,
         })
     }
@@ -141,6 +154,31 @@ impl ScyllaDb {
         let mut query = scylla::statement::Statement::new(query_text);
         query.set_consistency(consistency);
         Ok(scylla_db_session.prepare(query).await?)
+    }
+
+    pub async fn get_fastfs_meta(
+        &self,
+        predecessor_id: &str,
+        current_account_id: &str,
+        relative_path: &str,
+    ) -> anyhow::Result<Option<FastfsMetaRow>> {
+        let rows = self
+            .scylla_session
+            .execute_unpaged(
+                &self.select_fastfs_meta,
+                (
+                    predecessor_id.to_string(),
+                    current_account_id.to_string(),
+                    relative_path.to_string(),
+                ),
+            )
+            .await?
+            .into_rows_result()?;
+
+        Ok(rows
+            .rows::<FastfsMetaRow>()?
+            .next()
+            .transpose()?)
     }
 
     pub async fn get_fastfs(

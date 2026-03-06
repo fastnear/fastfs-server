@@ -2,7 +2,7 @@ mod scylladb;
 
 use crate::scylladb::ScyllaDb;
 use actix_cors::Cors;
-use actix_web::http::header;
+use actix_web::http::{header, StatusCode};
 use actix_web::{get, middleware, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use dotenv::dotenv;
 use fastnear_primitives::near_indexer_primitives::types::AccountId;
@@ -131,6 +131,43 @@ async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl 
     }
     tracing::info!(target: PROJECT_ID, "GET {} {} {}", predecessor_account_id, namespace_account_id, path);
 
+    let if_none_match = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string());
+
+    // If this is a conditional request, do a cheap metadata-only check first
+    if let Some(ref client_etag) = if_none_match {
+        let meta = app_state
+            .scylladb
+            .get_fastfs_meta(
+                predecessor_account_id.as_str(),
+                &namespace_account_id,
+                &path,
+            )
+            .await;
+        match meta {
+            Ok(Some(meta)) => {
+                let etag = format!("{}-{}", meta.receipt_id, meta.nonce);
+                if *client_etag == etag {
+                    return HttpResponse::build(StatusCode::NOT_MODIFIED)
+                        .append_header((header::ETAG, format!("\"{}\"", etag)))
+                        .append_header((
+                            header::CACHE_CONTROL,
+                            "public, max-age=60, stale-while-revalidate=31536000",
+                        ))
+                        .finish();
+                }
+            }
+            Ok(None) => return HttpResponse::NotFound().finish(),
+            Err(e) => {
+                tracing::error!(target: PROJECT_ID, "Error getting fastfs meta, {}", e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        }
+    }
+
     let res = app_state
         .scylladb
         .get_fastfs(
@@ -157,9 +194,15 @@ async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl 
     if let Some(first) = first {
         if first.offset == 0 {
             if let (Some(mime_type), Some(content)) = (first.mime_type, first.content) {
+                let etag = format!("{}-{}", first.receipt_id, first.nonce);
                 let mut response = HttpResponse::Ok();
                 let response = response
                     .append_header((header::CONTENT_TYPE, mime_type))
+                    .append_header((header::ETAG, format!("\"{}\"", etag)))
+                    .append_header((
+                        header::CACHE_CONTROL,
+                        "public, max-age=60, stale-while-revalidate=31536000",
+                    ))
                     .append_header(("x-fastdata-receipt-id", first.receipt_id.to_string()))
                     .append_header((
                         "x-fastdata-tx-hash",
