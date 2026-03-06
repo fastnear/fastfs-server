@@ -16,6 +16,7 @@ const OFFSET_ALIGNMENT: u32 = 1 << 20; // 1Mb
 #[derive(Clone)]
 pub struct AppState {
     pub hostname: String,
+    pub fallback_subdomain: Option<String>,
     pub scylladb: Arc<ScyllaDb>,
 }
 
@@ -50,6 +51,8 @@ async fn main() -> std::io::Result<()> {
             .expect("Can't create scylla db"),
     );
 
+    let fallback_subdomain = env::var("FALLBACK_SUBDOMAIN").ok();
+
     HttpServer::new(move || {
         // Configure CORS middleware
         let cors = Cors::default()
@@ -66,6 +69,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(AppState {
                 hostname: hostname.clone(),
+                fallback_subdomain: fallback_subdomain.clone(),
                 scylladb: Arc::clone(&scylladb),
             }))
             .wrap(cors)
@@ -82,26 +86,58 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-#[get("/{account_id}/{path:.*}")]
+#[get("/{first_segment}/{path:.*}")]
 async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl Responder {
-    let namespace_account_id = request.match_info().get("account_id").unwrap();
-    let mut path = request.match_info().get("path").unwrap().to_string();
+    let first_segment = request.match_info().get("first_segment").unwrap();
+    let raw_path = request.match_info().get("path").unwrap();
+    let hostname = request.connection_info().host().to_string();
+
+    // Check if this is a fallback subdomain request
+    let is_fallback = app_state.fallback_subdomain.as_ref().is_some_and(|fb| {
+        hostname
+            .strip_suffix(&app_state.hostname)
+            .map_or(false, |s| s == fb.trim_end_matches('.'))
+    });
+
+    let (predecessor_account_id, namespace_account_id, mut path) = if is_fallback {
+        // fallback.fastfs.io/root.near/fastfs.near/file.jpg
+        // first_segment = predecessor_id, path starts with account_id/...
+        let predecessor: AccountId = match first_segment.parse() {
+            Ok(id) => id,
+            Err(_) => return HttpResponse::BadRequest().body("Invalid predecessor account id"),
+        };
+        let (account_id, file_path) = match raw_path.split_once('/') {
+            Some((acc, p)) => (acc.to_string(), p.to_string()),
+            None => (raw_path.to_string(), String::new()),
+        };
+        (predecessor, account_id, file_path)
+    } else {
+        // root.near.fastfs.io/fastfs.near/file.jpg
+        let predecessor: Option<AccountId> = hostname
+            .strip_suffix(&app_state.hostname)
+            .and_then(|s| s.parse().ok());
+        if predecessor.is_none() {
+            return HttpResponse::InternalServerError().finish();
+        }
+        (
+            predecessor.unwrap(),
+            first_segment.to_string(),
+            raw_path.to_string(),
+        )
+    };
+
     if path.is_empty() || path.ends_with('/') {
         path += "index.html";
     }
-    let hostname = request.connection_info().host().to_string();
-    let predecessor_account_id: Option<AccountId> = hostname
-        .strip_suffix(&app_state.hostname)
-        .and_then(|s| s.parse().ok());
-    if predecessor_account_id.is_none() {
-        return HttpResponse::InternalServerError().finish();
-    }
-    let predecessor_account_id = predecessor_account_id.unwrap();
     tracing::info!(target: PROJECT_ID, "GET {} {} {}", predecessor_account_id, namespace_account_id, path);
 
     let res = app_state
         .scylladb
-        .get_fastfs(predecessor_account_id.as_str(), namespace_account_id, &path)
+        .get_fastfs(
+            predecessor_account_id.as_str(),
+            &namespace_account_id,
+            &path,
+        )
         .await;
     let data = match res {
         Ok(data) => data,
