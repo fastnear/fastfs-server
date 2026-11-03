@@ -4,7 +4,17 @@ version = "2.0.1"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.5.1"
+# Default features minus `http2`: the server only serves HTTP/1 via `.bind()`, and every actix-http
+# release depends on h2 0.3, which has no fix for RUSTSEC-2026-0258.
+actix-web = { version = "4.5.1", default-features = false, features = [
+    "macros",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+    "cookies",
+    "unicode",
+    "compat",
+] }
 actix-cors = "0.7.0"
 dotenv = "0.15.0"
 fastnear-primitives = "0.1.0"
