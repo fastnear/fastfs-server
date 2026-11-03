@@ -100,12 +100,17 @@ pub fn create_rustls_client_config() -> Arc<ClientConfig> {
 
 impl ScyllaDb {
     pub async fn new_scylla_session() -> anyhow::Result<Session> {
-        let scylla_url = env::var("SCYLLA_URL").expect("SCYLLA_URL must be set");
+        // Comma-separated list of contact points, e.g. "ip1:9142,ip2:9142"
+        let scylla_urls = env::var("SCYLLA_URL").expect("SCYLLA_URL must be set");
+        let known_nodes = scylla_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|node| !node.is_empty());
         let scylla_username = env::var("SCYLLA_USERNAME").expect("SCYLLA_USERNAME must be set");
         let scylla_password = env::var("SCYLLA_PASSWORD").expect("SCYLLA_PASSWORD must be set");
 
         let session: Session = SessionBuilder::new()
-            .known_node(scylla_url)
+            .known_nodes(known_nodes)
             .tls_context(Some(create_rustls_client_config()))
             .authenticator_provider(Arc::new(
                 scylla::authentication::PlainTextAuthenticator::new(
@@ -153,6 +158,8 @@ impl ScyllaDb {
     ) -> anyhow::Result<PreparedStatement> {
         let mut query = scylla::statement::Statement::new(query_text);
         query.set_consistency(consistency);
+        // Only used for SELECTs; lets the driver retry on another node if a connection breaks.
+        query.set_is_idempotent(true);
         Ok(scylla_db_session.prepare(query).await?)
     }
 
